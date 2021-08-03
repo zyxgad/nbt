@@ -238,7 +238,7 @@ def _make_scanner(context):
     if type_ == nbt.TAG_FLOAT:
       formater = FLOAT_STRUCT
     elif type_ == nbt.TAG_DOUBLE:
-      formater = DOUBLE
+      formater = DOUBLE_STRUCT
     else:
       formater = cls.fmt
     return cls(value=formater.unpack(hexToBytes(snumber, leng=cls.fmt.size))[0]), idx
@@ -285,6 +285,7 @@ def _make_scanner(context):
     while True:
       v = string[idx]
       if v == '"':
+        idx += 1
         break
       if v == '\\':
         idx += 1
@@ -372,7 +373,7 @@ def _make_scanner(context):
       if string[idx] in '\r\n,':
         idx += 1
         continue
-      assert False
+      raise json.JSONDecodeError('Unexpected char ' + repr(string[idx]), string, idx)
     return obj, idx
 
   _DECODER_MAP = {
