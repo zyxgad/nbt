@@ -1,4 +1,4 @@
-1
+
 from .nbt import *
 from .world import *
 from .region import *
