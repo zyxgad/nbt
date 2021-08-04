@@ -367,7 +367,10 @@ class TAG_Long_Array(TAG, MutableSequence):
     def _parse_buffer(self, buffer):
         length = TAG_Int(buffer=buffer).value
         self.update_fmt(length)
-        self.value = list(self.fmt.unpack(buffer.read(self.fmt.size)))
+        buf = buffer.read(self.fmt.size)
+        if len(buf) < self.fmt.size:
+            raise RuntimeError('len(buf) < self.fmt.size')
+        self.value = list(self.fmt.unpack(buf))
 
     def _render_buffer(self, buffer):
         length = len(self.value)
@@ -563,7 +566,6 @@ class TAG_Compound(TAG, MutableMapping):
         while True:
             type = TAG_Byte(buffer=buffer)
             if type.value == TAG_END:
-                # print("found tag_end")
                 break
             else:
                 name = TAG_String(buffer=buffer).value

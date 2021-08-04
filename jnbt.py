@@ -83,6 +83,15 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
   if _indent is not None and not isinstance(_indent, str):
     _indent = ' ' * _indent
 
+  def _encode_str(data, ignores=':,"]}\\ '):
+    if not data:
+      return '""'
+    if data.isascii() and data.isprintable():
+      for c in data:
+        if c in ignores:
+          return _encoder(data)
+    return data
+
   def _encode_gzip(data):
     zdata = base64.b64encode(gzip.compress(data)).decode('ascii')
     while zdata[-1] == '=': zdata = zdata[:-1]
@@ -98,12 +107,7 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
     return bytesToHex(formater.pack(value.value))
 
   def _nbt_string(value):
-    if not value.value:
-      return '""'
-    if value.value.isascii() and value.value.isprintable() and\
-      ',' not in value.value and '"' not in value.value and '\\' not in value.value and ' ' not in value.value:
-      return value.value
-    return _encoder(value.value)
+    return _encode_str(value.value)
 
   def _nbt_array(array):
     if array.__class__.id == nbt.TAG_BYTE_ARRAY:
@@ -141,8 +145,8 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
       if markerid in markers:
         raise ValueError("Circular reference detected")
       markers[markerid] = dct
-    # if in_list: yield '{'
     if len(dct.tags) == 0:
+      if in_list: yield '{'
       yield '}'
       return
     if _indent is not None:
@@ -151,10 +155,10 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
     else:
       item_separator = _item_separator
     value = dct.tags[0]
-    yield value.name + _key_separator
+    yield _encode_str(value.name) + _key_separator
     yield from _iterencode(value, _current_indent_level)
     for value in dct.tags[1:]:
-      yield item_separator + value.name + _key_separator
+      yield item_separator + _encode_str(value.name) + _key_separator
       yield from _iterencode(value, _current_indent_level)
       # yield '\n' + _indent * _current_indent_level
     yield '}'
@@ -177,9 +181,9 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
       yield s
     elif o.__class__.id == nbt.TAG_LIST:
       s = ''.join(_iterencode_list(o, _current_indent_level, in_list=in_list, first_item=first_item))
-      if len(s) > 256:
+      if len(s) > 256 and s.count('\n') < 32:
         zs = _encode_gzip(s.encode('ascii'))
-        s = zs if len(s) > len(zs) else s
+        s = zs if len(zs) / len(s) < 0.8 else s
       yield s
     elif o.__class__.id == nbt.TAG_COMPOUND:
       yield from _iterencode_compound(o, _current_indent_level, in_list=in_list)
@@ -204,7 +208,7 @@ class NbtJsonDecoder(json.JSONDecoder):
   NUMBER_RE = re.compile(
       r'[0-9A-Fa-f]+',
       (re.VERBOSE | re.MULTILINE | re.DOTALL))
-  STR_MATCH = re.compile(r'[0-9A-Za-z~!@$%()\-_+=|:.<>/?]+')
+  STR_MATCH = re.compile(r'[0-9A-Za-z~!@$%()\-_+=|.<>/?]+')
   B64_MATCH = re.compile(r'[0-9A-Za-z+/]+')
   BACKSLASH = {
     '"': '"', '\\': '\\', '/': '/',
@@ -280,8 +284,8 @@ def _make_scanner(context):
         idx += 6
     return v, idx
 
-  def _parse_string0(string, idx):
-    nbt_str = nbt.TAG_String(value='')
+  def _get_string0(string, idx):
+    s = ''
     while True:
       v = string[idx]
       if v == '"':
@@ -290,7 +294,7 @@ def _make_scanner(context):
       if v == '\\':
         idx += 1
         esc = string[idx]
-        if esc in BACKSLASH:
+        if esc in NbtJsonDecoder.BACKSLASH:
           v = esc
         elif esc == 'x':
           v = _decode_xXX(string, idx + 1)
@@ -299,15 +303,22 @@ def _make_scanner(context):
           v, idx = _decode_uXXXX()
         else:
           raise json.JSONDecodeError("Invalid \\escape: {0!r}".format(esc), string, idx - 1)
-      nbt_str.value += v
+      s += v
       idx += 1
-    return nbt_str, idx
+    return s, idx
+
+  def _get_string(string, idx):
+    if string[idx] == '"':
+      return _get_string0(string, idx + 1)
+    m = NbtJsonDecoder.STR_MATCH.match(string, idx)
+    if m is None:
+      raise json.JSONDecodeError("Can not decode string", string, idx)
+    s = m.group(0)
+    return s, idx + len(s)
 
   def _parse_string(string, idx):
-    if string[idx] == '"':
-      return _parse_string0(string, idx + 1)
-    nbt_str = nbt.TAG_String(value=NbtJsonDecoder.STR_MATCH.match(string, idx).group(0))
-    return nbt_str, idx + len(nbt_str.value)
+    s, idx = _get_string(string, idx)
+    return nbt.TAG_String(value=s), idx
 
   def _parse_list(string, idx, in_list=False, is_first=False, type_=None):
     use_zip = string[idx] == '>'
@@ -360,16 +371,18 @@ def _make_scanner(context):
       return obj, idx + 1
     slen = len(string)
     while idx < slen:
-      idx0 = string.index(':', idx)
-      key = string[idx:idx0]
-      value, idx = _scan_once(string, idx0 + 1)
+      key, idx = _get_string(string, skipwhite(string, idx))
+      value, idx = _scan_once(string, idx + 1)
       value.name = key
       obj.tags.append(value)
-      idx = skipwhite(string, idx, oneline=True)
-      if idx >= len(string): break
-      if string[idx] == '}':
-        idx += 1
+      idx0 = skipwhite(string, idx)
+      if idx0 >= len(string):
+        idx = idx0
         break
+      if string[idx0] == '}':
+        idx = idx0 + 1
+        break
+      idx = skipwhite(string, idx, oneline=True)
       if string[idx] in '\r\n,':
         idx += 1
         continue
@@ -396,7 +409,10 @@ def _make_scanner(context):
     if idx >= len(string):
       raise StopIteration(idx) from None
     if nexttype is None:
-      nexttype = int(string[idx], 16)
+      try:
+        nexttype = int(string[idx], 16)
+      except ValueError as e:
+        raise json.JSONDecodeError(str(e), string, idx) from None
       idx += 1
     if nexttype not in _DECODER_MAP:
       raise ValueError(f'type {nexttype} not know')

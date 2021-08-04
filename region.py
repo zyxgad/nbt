@@ -5,7 +5,7 @@ For more information about the region file format:
 https://minecraft.gamepedia.com/Region_file_format
 """
 
-from .nbt import NBTFile, MalformedFileError
+from .nbt import TAG_Compound, NBTFile, MalformedFileError
 from struct import pack, unpack
 from collections import Mapping
 import zlib
@@ -288,8 +288,14 @@ class RegionFile(object):
         self._parse_header()
         self._parse_chunk_headers()
 
+    # use in different process
+    def clone(self):
+        cloned = self.__class__(filename=self.filename, fileobj=self.file, chunkclass=self.chunkclass)
+        cloned._nbt_cache = self._nbt_cache.copy()
+        return cloned
+
     def clear_cache(self, x=None, z=None):
-        clear_func = lambda x, z: (x, z) in self._nbt_cache and self._nbt_cache.pop((x, z))
+        clear_func = lambda x, z: self._nbt_cache.pop((x, z), None)
         if x is None:
             clear_func = (lambda clear_func: lambda _, z: [clear_func(xx, z) for xx in range(x)])(clear_func)
         if z is None:
@@ -474,34 +480,6 @@ class RegionFile(object):
         """
         return [m for m in self.metadata.values() if m.is_created()]
 
-    def get_chunks(self):
-        """
-        Return the x,z coordinates and length of the chunks that are defined in te regionfile.
-        This includes chunks which may not be readable for whatever reason.
-
-        Warning: despite the name, this function does not actually return the chunk,
-        but merely it's metadata. Use get_chunk(x,z) to get the NBTFile, and then Chunk()
-        to get the actual chunk.
-        
-        This method is deprecated. Use :meth:`get_metadata` instead.
-        """
-        return self.get_chunk_coords()
-
-    def get_chunk_coords(self):
-        """
-        Return the x,z coordinates and length of the chunks that are defined in te regionfile.
-        This includes chunks which may not be readable for whatever reason.
-        
-        This method is deprecated. Use :meth:`get_metadata` instead.
-        """
-        chunks = []
-        for x in range(32):
-            for z in range(32):
-                m = self.metadata[x,z]
-                if m.is_created():
-                    chunks.append({'x': x, 'z': z, 'length': m.blocklength})
-        return chunks
-
     def iter_chunks(self):
         """
         Yield each readable chunk present in the region.
@@ -581,7 +559,6 @@ class RegionFile(object):
         # The chunk is always read, but in case of an error, the exception may be different 
         # based on the status.
 
-        err = None
         try:
             # offset comes in sectors of 4096 bytes + length bytes + compression byte
             self.file.seek(m.blockstart * SECTOR_LENGTH + 5)
@@ -606,8 +583,6 @@ class RegionFile(object):
         except Exception as e:
             # Deliberately catch the Exception and re-raise.
             # The details in gzip/zlib/nbt are irrelevant, just that the data is garbled.
-            err = '%s' % e # avoid str(e) due to Unicode issues in Python 2.
-        if err:
             # don't raise during exception handling to avoid the warning 
             # "During handling of the above exception, another exception occurred".
             # Python 3.3 solution (see PEP 409 & 415): "raise ChunkDataError(str(e)) from None"
@@ -616,33 +591,29 @@ class RegionFile(object):
             elif m.status == STATUS_CHUNK_OVERLAPPING:
                 raise ChunkHeaderError('Chunk %d,%d is overlapping with another chunk' % (x,z))
             else:
-                raise ChunkDataError(err)
+                raise ChunkDataError(str(e))# from None
 
-    def get_nbt(self, x, z):
+    def get_nbt(self, x, z, cache=True):
         """
         Return a NBTFile of the specified chunk.
         Raise InconceivedChunk if the chunk is not included in the file.
         """
-        # TODO: cache results?
-        if (x, z) in self._nbt_cache:
+        if cache and (x, z) in self._nbt_cache:
             return self._nbt_cache[x, z].copy()
         data = self.get_blockdata(x, z) # This may raise a RegionFileFormatError.
         data = BytesIO(data)
-        err = None
         try:
             nbt = NBTFile(buffer=data)
-            if self.loc.x != None:
-                x += self.loc.x*32
-            if self.loc.z != None:
-                z += self.loc.z*32
+            if self.loc.x is not None:
+                x += self.loc.x * 32
+            if self.loc.z is not None:
+                z += self.loc.z * 32
             nbt.loc = Location(x=x, z=z)
             self._nbt_cache[x, z] = nbt
             return nbt.copy()
             # this may raise a MalformedFileError. Convert to ChunkDataError.
         except MalformedFileError as e:
-            err = '%s' % e # avoid str(e) due to Unicode issues in Python 2.
-        if err:
-            raise ChunkDataError(err)
+            raise ChunkDataError(str(e))# from None
 
     def get_chunk(self, x, z):
         """
@@ -681,7 +652,7 @@ class RegionFile(object):
             raise ChunkDataError("Chunk is too large (%d sectors exceeds 255 maximum)" % (nsectors))
 
         # Ensure file has a header
-        if self.size < 2*SECTOR_LENGTH:
+        if self.size < 2 * SECTOR_LENGTH:
             self._init_file()
 
         # search for a place where to write the chunk:
@@ -749,12 +720,16 @@ class RegionFile(object):
         # self.parse_header()
         # self.parse_chunk_headers()
 
-    def write_chunk(self, x, z, nbt_file):
+    def write_chunk(self, x, z, chunk):
         """
         Pack the NBT file as binary data, and write to file in a compressed format.
         """
+        if not isinstance(chunk, NBTFile):
+            assert isinstance(chunk, TAG_Compound)
+            chunk, chunk0 = NBTFile(), chunk
+            chunk.tags = chunk0.tags
         data = BytesIO()
-        nbt_file.write_file(buffer=data) # render to buffer; uncompressed
+        chunk.write_file(buffer=data) # render to buffer; uncompressed
         self.write_blockdata(x, z, data.getvalue())
 
     def unlink_chunk(self, x, z):
