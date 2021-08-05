@@ -213,41 +213,33 @@ class AnvilSection(object):
         bl = 64
         ll = states[0]
 
-        for i in range(0,4096):
+        for _ in range(4096):
             if bl == 0:
-                j = j + 1
+                j += 1
                 ll = states[j]
                 bl = 64
 
             if nb <= bl:
                 self.indexes.append(ll & m)
-                ll = ll >> nb
-                bl = bl - nb
+                ll >>= nb
+                bl -= nb
             else:
-                j = j + 1
-                lh = states[j]
+                j += 1
                 bh = nb - bl
 
-                lh = (lh & (pow(2, bh) - 1)) << bl
-                ll = (ll & (pow(2, bl) - 1))
-                self.indexes.append(lh | ll)
+                self.indexes.append(((states[j] & (pow(2, bh) - 1)) << bl) | (ll & (pow(2, bl) - 1)))
 
-                ll = states[j]
-                ll = ll >> bh
-                bl = 64 - bh
+                ll = states[j] >> bh
+                bl = bl - nb + 64
 
 
     def get_block(self, x, y, z):
         # Blocks are stored in YZX order
-        i = y * 256 + z * 16 + x
-        p = self.indexes[i]
-        return self.names[p]
+        return self.names[self.indexes[y * 256 + z * 16 + x]]
 
 
     def iter_block(self):
-        for i in range(0, 4096):
-            p = self.indexes[i]
-            yield self.names[p]
+        yield from (self.names[self.indexes[i]] for i in range(4096))
 
 
 # Chunck in Anvil new format
@@ -262,11 +254,11 @@ class AnvilChunk(Chunk):
         # Backported to first Anvil version (= 0) from examples
         # Could work with other versions, but has to be tested first
 
-        try:
+        if 'DataVersion' in nbt:
             version = nbt['DataVersion'].value
             if version != 1343 and version != 1631:
                 raise NotImplementedError('DataVersion %d not implemented' % (version,))
-        except KeyError:
+        else:
             version = 0
 
         # Load all sections
@@ -279,22 +271,17 @@ class AnvilChunk(Chunk):
 
     def get_section(self, y):
         """Get a section from Y index."""
-        if y in self.sections:
-            return self.sections[y]
-
-        return None
+        return self.sections.get(y, None)
 
 
     def get_max_height(self):
-        ymax = 0
-        for y in self.sections.keys():
-            if y > ymax: ymax = y
+        ymax = len(self.sections) and max(self.sections.keys())
         return ymax * 16 + 15
 
 
     def get_block(self, x, y, z):
         """Get a block from relative x,y,z."""
-        sy,by = divmod(y, 16)
+        sy, by = divmod(y, 16)
         section = self.get_section(sy)
         if section == None:
             return None
@@ -303,9 +290,7 @@ class AnvilChunk(Chunk):
 
 
     def iter_block(self):
-        for s in self.sections.values():
-            for b in s.iter_block():
-                yield b
+        yield from (b for s in self.sections.values() for b in s.iter_block())
 
 
 class BlockArray(object):
@@ -315,28 +300,19 @@ class BlockArray(object):
         if isinstance(blocksBytes, (bytearray, array.array)):
             self.blocksList = list(blocksBytes)
         else:
-            self.blocksList = [0]*32768 # Create an empty block list (32768 entries of zero (air))
+            self.blocksList = [0] * 32768 # Create an empty block list (32768 entries of zero (air))
 
         if isinstance(dataBytes, (bytearray, array.array)):
             self.dataList = list(dataBytes)
         else:
-            self.dataList = [0]*16384 # Create an empty data list (32768 4-bit entries of zero make 16384 byte entries)
+            self.dataList = [0] * 16384 # Create an empty data list (32768 4-bit entries of zero make 16384 byte entries)
 
     def get_blocks_struct(self):
         """Return a dictionary with block ids keyed to (x, y, z)."""
-        cur_x = 0
-        cur_y = 0
-        cur_z = 0
+        cur_g = ((x, y, z) for x in range(16) for z in range(16) for y in range(127))
         blocks = {}
         for block_id in self.blocksList:
-            blocks[(cur_x,cur_y,cur_z)] = block_id
-            cur_y += 1
-            if (cur_y > 127):
-                cur_y = 0
-                cur_z += 1
-                if (cur_z > 15):
-                    cur_z = 0
-                    cur_x += 1
+            blocks[cur_g.send(None)] = block_id
         return blocks
 
     # Give blockList back as a byte array
@@ -344,7 +320,7 @@ class BlockArray(object):
         """Return a list of all blocks in this chunk."""
         if buffer:
             length = len(self.blocksList)
-            return BytesIO(pack(">i", length)+self.get_blocks_byte_array())
+            return BytesIO(pack(">i", length) + self.get_blocks_byte_array())
         else:
             return array.array('B', self.blocksList).tostring()
 
@@ -352,7 +328,7 @@ class BlockArray(object):
         """Return a list of data for all blocks in this chunk."""
         if buffer:
             length = len(self.dataList)
-            return BytesIO(pack(">i", length)+self.get_data_byte_array())
+            return BytesIO(pack(">i", length) + self.get_data_byte_array())
         else:
             return array.array('B', self.dataList).tostring()
 
@@ -360,67 +336,64 @@ class BlockArray(object):
         """Return a heightmap, representing the highest solid blocks in this chunk."""
         non_solids = [0, 8, 9, 10, 11, 38, 37, 32, 31]
         if buffer:
-            return BytesIO(pack(">i", 256)+self.generate_heightmap()) # Length + Heightmap, ready for insertion into Chunk NBT
+            return BytesIO(pack(">i", 256) + self.generate_heightmap()) # Length + Heightmap, ready for insertion into Chunk NBT
         else:
-            bytes = []
+            bytes_ = []
             for z in range(16):
                 for x in range(16):
                     for y in range(127, -1, -1):
                         offset = y + z*128 + x*128*16
                         if (self.blocksList[offset] not in non_solids or y == 0):
-                            bytes.append(y+1)
+                            bytes_.append(y+1)
                             break
             if (as_array):
-                return bytes
+                return bytes_
             else:
-                return array.array('B', bytes).tostring()
+                return array.array('B', bytes_).tostring()
 
-    def set_blocks(self, list=None, dict=None, fill_air=False):
+    def set_blocks(self, list_=None, dict_=None, fill_air=False):
         """
         Sets all blocks in this chunk, using either a list or dictionary.  
         Blocks not explicitly set can be filled to air by setting fill_air to True.
         """
-        if list:
+        if list_:
             # Inputting a list like self.blocksList
-            self.blocksList = list
-        elif dict:
+            self.blocksList = list_
+        elif dict_:
             # Inputting a dictionary like result of self.get_blocks_struct()
-            list = []
-            for x in range(16):
-                for z in range(16):
-                    for y in range(128):
-                        coord = x,y,z
-                        offset = y + z*128 + x*128*16
-                        if (coord in dict):
-                            list.append(dict[coord])
-                        else:
-                            if (self.blocksList[offset] and not fill_air):
-                                list.append(self.blocksList[offset])
-                            else:
-                                list.append(0) # Air
-            self.blocksList = list
+            list_ = []
+            for coord in ((x, y, z) for x in range(16) for z in range(16) for y in range(128)):
+                offset = coord[1] + coord[2] * 128 + coord[0] * 128 * 16
+                if (coord in dict_):
+                    list_.append(dict_[coord])
+                else:
+                    if (self.blocksList[offset] and not fill_air):
+                        list_.append(self.blocksList[offset])
+                    else:
+                        list_.append(0) # Air
+            self.blocksList = list_
         else:
             # None of the above...
             return False
         return True
 
-    def set_block(self, x,y,z, id, data=0):
+    def set_block(self, x, y, z, id, data=0):
         """Sets the block a x, y, z to the specified id, and optionally data."""
-        offset = y + z*128 + x*128*16
+        offset = y + z * 128 + x * 128 * 16
         self.blocksList[offset] = id
         if (offset % 2 == 1):
             # offset is odd
-            index = (offset-1)//2
+            index = (offset - 1) // 2
             b = self.dataList[index]
             self.dataList[index] = (b & 240) + (data & 15) # modify lower bits, leaving higher bits in place
         else:
             # offset is even
-            index = offset//2
+            index = offset // 2
             b = self.dataList[index]
             self.dataList[index] = (b & 15) + (data << 4 & 240) # modify ligher bits, leaving lower bits in place
 
     # Get a given X,Y,Z or a tuple of three coordinates
-    def get_block(self, x,y,z, coord=False):
+    def get_block(self, x, y, z, coord=False):
         """Return the id of the block at x, y, z."""
         """
         Laid out like:
@@ -435,5 +408,5 @@ class BlockArray(object):
                 blocks.append(Block(x,y,z))
         """
 
-        offset = y + z*128 + x*128*16 if (coord == False) else coord[1] + coord[2]*128 + coord[0]*128*16
+        offset = y + z * 128 + x * 128 * 16 if not coord else coord[1] + coord[2] * 128 + coord[0] * 128 * 16
         return self.blocksList[offset]

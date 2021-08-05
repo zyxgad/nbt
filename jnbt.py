@@ -115,13 +115,14 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
     array.update_fmt(len(array.value))
     return bytesToHex(array.fmt.pack(*array.value), short=False)
 
-  def _iterencode_list(lst, _current_indent_level, in_list=False, first_item=False):
+  def _iterencode_list(lst, _current_indent_level, in_list=False):
     if markers is not None:
       markerid = id(lst)
       if markerid in markers:
         raise ValueError("Circular reference detected")
       markers[markerid] = lst
-    if not in_list or first_item: yield HEX_BASE[int(lst.tagID)]
+    
+    yield HEX_BASE[int(lst.tagID)]
     # yield '['
     if len(lst.tags) == 0:
       if in_list: yield ']'
@@ -131,7 +132,7 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
       item_separator = '\n' + _indent * _current_indent_level
     else:
       item_separator = _item_separator
-    yield from _iterencode(lst.tags[0], _current_indent_level, in_list=True, first_item=not in_list or first_item)
+    yield from _iterencode(lst.tags[0], _current_indent_level, in_list=True)
     for value in lst.tags[1:]:
       yield item_separator
       yield from _iterencode(value, _current_indent_level, in_list=True)
@@ -165,7 +166,7 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
     if markers is not None:
       del markers[markerid]
 
-  def _iterencode(o, _current_indent_level, in_list=False, first_item=False):
+  def _iterencode(o, _current_indent_level, in_list=False):
     if not in_list: yield HEX_BASE[int(o.__class__.id)]
     if o.__class__.id == nbt.TAG_END:
       yield '0'
@@ -180,11 +181,13 @@ def _make_json_iterencode(markers, _default, _encoder, _indent,
         s = zs if len(s) > len(zs) else s
       yield s
     elif o.__class__.id == nbt.TAG_LIST:
-      s = ''.join(_iterencode_list(o, _current_indent_level, in_list=in_list, first_item=first_item))
+      it = _iterencode_list(o, _current_indent_level, in_list=in_list)
+      t = next(it)
+      s = ''.join(it)
       if len(s) > 256 and s.count('\n') < 32:
         zs = _encode_gzip(s.encode('ascii'))
         s = zs if len(zs) / len(s) < 0.8 else s
-      yield s
+      yield t + s
     elif o.__class__.id == nbt.TAG_COMPOUND:
       yield from _iterencode_compound(o, _current_indent_level, in_list=in_list)
     else:
@@ -220,6 +223,13 @@ class NbtJsonDecoder(json.JSONDecoder):
 
 def _make_scanner(context):
   memo = context.memo
+
+  def next_type(string, idx):
+    t = string[idx]
+    if t not in HEX_BASE:
+      raise json.JSONDecodeError('Unexpected type ' + t, string, idx)
+    return int(t, 16), idx + 1
+
   def skipwhite(string, idx, whites=' \t\f', oneline=False):
     if not oneline:
       whites += '\r\n'
@@ -236,8 +246,6 @@ def _make_scanner(context):
 
   def _parse_num(string, idx, type_):
     snumber = NbtJsonDecoder.NUMBER_RE.match(string, idx).group(0)
-    idx += len(snumber)
-    assert not string[idx].isidentifier()
     cls = nbt.TAGLIST[type_]
     if type_ == nbt.TAG_FLOAT:
       formater = FLOAT_STRUCT
@@ -245,13 +253,19 @@ def _make_scanner(context):
       formater = DOUBLE_STRUCT
     else:
       formater = cls.fmt
-    return cls(value=formater.unpack(hexToBytes(snumber, leng=cls.fmt.size))[0]), idx
+    try:
+      num = formater.unpack(hexToBytes(snumber, leng=formater.size))[0]
+    except struct.error as e:
+      print('snumber:', snumber, hexToBytes(snumber, leng=formater.size))
+      print('formater:', formater, formater.size, formater.format)
+      raise json.JSONDecodeError(str(e), string, idx) from None
+    return cls(value=num), idx + len(snumber)
 
   def _parse_array(string, idx, type_):
     if string[idx] in ' \t\f\r\n,]}':
       array = nbt.TAGLIST[type_]()
       if type_ == nbt.TAG_BYTE_ARRAY:
-        array.value = b''
+        array.value = bytearray()
       else:
         array.update_fmt(0)
         array.value = []
@@ -320,35 +334,20 @@ def _make_scanner(context):
     s, idx = _get_string(string, idx)
     return nbt.TAG_String(value=s), idx
 
-  def _parse_list(string, idx, in_list=False, is_first=False, type_=None):
+  def _parse_list(string, idx):
+    nbt_list = nbt.TAG_List()
+    nbt_list.tagID, idx = next_type(string, idx)
     use_zip = string[idx] == '>'
     if use_zip:
       data, idx_ = _parse_gzip(string, idx + 1)
       string = data.decode('ascii')
       idx = 0
-    nbt_list = nbt.TAG_List()
-    nbt_list.tagID = type_
-    if nbt_list.tagID is None:
-      nbt_list.tagID = int(string[idx], 16)
-      idx += 1
     idx = skipwhite(string, idx, oneline=True)
     if string[idx] in '\r\n]}':
       return nbt_list, (idx_ if use_zip else (idx + 1 if string[idx] == ']' else idx))
-    first = False
-    list_child = nbt_list.tagID == nbt.TAG_LIST
-    if list_child and not in_list or is_first:
-      first = True
-      t = int(string[idx], 16)
-      idx += 1
     slen = len(string)
     while idx < slen:
-      value, idx = (
-        _parse_list(string, idx, in_list=True, is_first=first, type_=t)
-        if list_child else
-        _scan_once(string, idx, nexttype=nbt_list.tagID)
-      )
-      if first:
-        first = False
+      value, idx = _scan_once(string, idx, nexttype=nbt_list.tagID)
       nbt_list.tags.append(value)
       idx = skipwhite(string, idx, oneline=True)
       if idx >= len(string): break
@@ -360,7 +359,7 @@ def _make_scanner(context):
       if string[idx] in '\r\n,':
         idx += 1
         continue
-      assert False
+      raise json.JSONDecodeError('Unexpected char ' + repr(string[idx]), string, idx)
     return nbt_list, idx_ if use_zip else idx
 
   def _parse_compound(string, idx):
@@ -409,13 +408,9 @@ def _make_scanner(context):
     if idx >= len(string):
       raise StopIteration(idx) from None
     if nexttype is None:
-      try:
-        nexttype = int(string[idx], 16)
-      except ValueError as e:
-        raise json.JSONDecodeError(str(e), string, idx) from None
-      idx += 1
+      nexttype, idx = next_type(string, idx)
     if nexttype not in _DECODER_MAP:
-      raise ValueError(f'type {nexttype} not know')
+      raise ValueError(f'type {nexttype} is unknow')
     return _DECODER_MAP[nexttype](string, idx)
 
   def scan_once(string, idx):
